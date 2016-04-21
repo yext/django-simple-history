@@ -36,6 +36,7 @@ else:  # south configuration for CustomForeignKeyField
         [], ["^simple_history.models.CustomForeignKeyField"])
 
 from .manager import HistoryDescriptor
+from . import register
 
 registered_models = {}
 
@@ -44,9 +45,10 @@ class HistoricalRecords(object):
     thread = threading.local()
 
     def __init__(self, verbose_name=None, bases=(models.Model,),
-                 user_related_name='+'):
+                 user_related_name='+', m2m_fields=None):
         self.user_set_verbose_name = verbose_name
         self.user_related_name = user_related_name
+        self.m2m_fields = m2m_fields
         try:
             if isinstance(bases, six.string_types):
                 raise TypeError
@@ -57,8 +59,48 @@ class HistoricalRecords(object):
     def contribute_to_class(self, cls, name):
         self.manager_name = name
         self.module = cls.__module__
-        models.signals.class_prepared.connect(self.finalize, sender=cls)
+        models.signals.class_prepared.connect(self.finalize, sender=cls, weak=False)
         self.add_extra_methods(cls)
+
+    def setup_m2m_history(self, cls):
+        m2m_history_fields = self.m2m_fields
+        if m2m_history_fields:
+            assert isinstance(m2m_history_fields, list) or isinstance(m2m_history_fields, tuple), \
+                'm2m_history_fields must be a list or tuple'
+            for field_name in m2m_history_fields:
+                field = getattr(cls, field_name).field
+                assert isinstance(field, models.fields.related.ManyToManyField), \
+                    '%s must be a ManyToManyField' % field_name
+                if not sum([isinstance(item, HistoricalRecords) for item in field.rel.through.__dict__.values()]):
+                    field.rel.through.history = HistoricalRecords()
+                    register(field.rel.through, app=self.module.split('.')[0])
+
+    def m2m_changed(self, action, instance, sender, **kwargs):
+        source_field_name, target_field_name = None, None
+        for field_name, field_value in sender.__dict__.items():
+            if isinstance(field_value, models.fields.related.ReverseSingleRelatedObjectDescriptor):
+                try:
+                    root_model = field_value.field.related.parent_model
+                except AttributeError:
+                    root_model = field_value.field.related.model
+
+                if root_model == kwargs['model']:
+                    target_field_name = field_name
+                elif root_model == type(instance):
+                    source_field_name = field_name
+
+        items = sender.objects.filter(**{source_field_name: instance})
+        if kwargs['pk_set']:
+            items = items.filter(**{target_field_name + '__id__in': kwargs['pk_set']})
+        for item in items:
+            if action == 'post_add':
+                if hasattr(item, 'skip_history_when_saving'):
+                    return
+                self.create_historical_record(item, '+')
+            elif action == 'pre_remove':
+                self.create_historical_record(item, '-')
+            elif action == 'pre_clear':
+                self.create_historical_record(item, '-')
 
     def add_extra_methods(self, cls):
         def save_without_historical_record(self, *args, **kwargs):
@@ -77,6 +119,7 @@ class HistoricalRecords(object):
                 save_without_historical_record)
 
     def finalize(self, sender, **kwargs):
+        self.setup_m2m_history(sender)
         history_model = self.create_history_model(sender)
         module = importlib.import_module(self.module)
         setattr(module, history_model.__name__, history_model)
@@ -86,6 +129,8 @@ class HistoricalRecords(object):
         models.signals.post_save.connect(self.post_save, sender=sender,
                                          weak=False)
         models.signals.post_delete.connect(self.post_delete, sender=sender,
+                                           weak=False)
+        models.signals.m2m_changed.connect(self.m2m_changed, sender=sender,
                                            weak=False)
 
         descriptor = HistoryDescriptor(history_model)
